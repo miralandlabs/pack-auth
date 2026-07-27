@@ -1,0 +1,47 @@
+use vercel_runtime::{Body, Response, StatusCode};
+
+pub fn add_cors_headers(builder: http::response::Builder) -> http::response::Builder {
+    builder
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        .header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, Idempotency-Key",
+        )
+}
+
+pub fn json_response<T: serde::Serialize>(status: u16, value: &T) -> Response<Body> {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    add_cors_headers(
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json"),
+    )
+    .body(Body::Text(
+        serde_json::to_string(value).unwrap_or_else(|_| "{}".into()),
+    ))
+    .expect("valid json response")
+}
+
+pub fn cors_options() -> Response<Body> {
+    add_cors_headers(
+        Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("Access-Control-Max-Age", "86400"),
+    )
+    .body(Body::Empty)
+    .expect("valid CORS response")
+}
+
+pub fn parse_wallet_path(path: &str, suffix: &str) -> Option<String> {
+    let rest = path.strip_prefix("/v1/services/")?;
+    let wallet = rest.strip_suffix(suffix)?.trim_end_matches('/');
+    (!wallet.is_empty()).then(|| wallet.to_string())
+}
+
+pub fn parse_query_map(query: &str) -> std::collections::HashMap<String, String> {
+    if query.trim().is_empty() {
+        return std::collections::HashMap::new();
+    }
+    serde_qs::from_str(query).unwrap_or_default()
+}

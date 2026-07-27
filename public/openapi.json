@@ -1,0 +1,28 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "pack-auth API",
+    "version": "0.1.0",
+    "description": "Wallet-authorized usage-pack issuance with atomic, idempotent per-use consumption."
+  },
+  "paths": {
+    "/health": { "get": { "summary": "Health check", "responses": { "200": { "description": "OK" } } } },
+    "/.well-known/jwks.json": { "get": { "summary": "RS256 public keys", "responses": { "200": { "description": "JWKS" } } } },
+    "/v1/services/{wallet}/challenge": { "get": { "summary": "Create a wallet-signing challenge", "parameters": [{ "name": "wallet", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "action", "in": "query", "required": true, "schema": { "enum": ["register", "update", "retire", "issue", "revoke", "list"] } }], "responses": { "200": { "description": "Challenge" } } } },
+    "/v1/services/{wallet}/register": { "post": { "summary": "Register a pack service", "responses": { "200": { "description": "Registered" } } } },
+    "/v1/services/{wallet}/update": { "post": { "summary": "Update a pack service", "responses": { "200": { "description": "Updated" } } } },
+    "/v1/services/{wallet}/retire": { "post": { "summary": "Retire a pack service", "responses": { "200": { "description": "Retired" } } } },
+    "/v1/services/{wallet}/packs": { "post": { "summary": "List packs issued by this merchant", "responses": { "200": { "description": "Pack list" } } } },
+    "/v1/packs/issue": { "post": { "summary": "Issue a pack after seller-side payment settlement", "responses": { "200": { "description": "Bearer pack token" } } } },
+    "/v1/packs/consume": { "post": { "summary": "Atomically consume one use", "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string", "minLength": 8, "maxLength": 200 } }], "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Consumed or idempotently replayed" }, "402": { "description": "Pack exhausted" }, "409": { "description": "Idempotency conflict" } } } },
+    "/v1/packs/introspect": { "post": { "summary": "Read authoritative remaining uses", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Pack state" } } } },
+    "/v1/packs/revoke": { "post": { "summary": "Revoke a pack", "responses": { "200": { "description": "Revoked" } } } },
+    "/v1/revocations": { "get": { "summary": "Incremental revocation feed", "responses": { "200": { "description": "Revocations" } } } },
+    "/v1/marketplace/packs": { "get": { "summary": "List public pack products", "responses": { "200": { "description": "Catalog" } } } },
+    "/v1/marketplace/packs/{service_id}": { "get": { "summary": "Get a public pack product", "responses": { "200": { "description": "Catalog item" } } } },
+    "/v1/info/{service_id}": { "get": { "summary": "Get registration status", "responses": { "200": { "description": "Service" } } } }
+  },
+  "components": {
+    "securitySchemes": { "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT" } }
+  }
+}

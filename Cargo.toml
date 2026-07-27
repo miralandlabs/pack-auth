@@ -1,0 +1,44 @@
+[package]
+name = "pack-auth"
+description = "Hosted usage-pack JWT service with atomic, idempotent consumption"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "auth_api"
+path = "src/bin/auth_api.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+http = "1.0"
+vercel_runtime = "1.1.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_qs = "0.14"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+getrandom = "0.2"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+solana-pubkey = { version = "4.0", features = ["serde"] }
+solana-signature = { version = "3.1", features = ["verify"] }
+deadpool-postgres = { version = "0.14", features = ["serde"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+postgres-openssl = "0.5"
+openssl = "0.10"
+jsonwebtoken = "9"
+rsa = { version = "0.9", features = ["pem"] }
+
+[dev-dependencies]
+solana-keypair = "3.1"
+solana-signer = "3.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
