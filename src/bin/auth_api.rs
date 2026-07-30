@@ -30,6 +30,8 @@ async fn route(state: Arc<AppState>, request: Request) -> Response<Body> {
     let query = request.uri().query().unwrap_or_default().to_string();
     let authorization = header(&request, "authorization");
     let idempotency_key = header(&request, "idempotency-key");
+    let cookie = header(&request, "cookie");
+    let origin = header(&request, "origin");
     let body = match body_to_string(request.into_body()) {
         Ok(body) => body,
         Err(message) => {
@@ -83,18 +85,26 @@ async fn route(state: Arc<AppState>, request: Request) -> Response<Body> {
             .await
         }
         ("POST", "/v1/packs/issue") => api::handle_issue(state, body).await,
+        ("POST", "/v1/packs/session") => {
+            api::handle_create_session(state, authorization.as_deref(), origin.as_deref(), body)
+                .await
+        }
         ("POST", "/v1/packs/consume") => {
             api::handle_consume(
                 state,
-                authorization.as_deref(),
+                cookie.as_deref(),
+                origin.as_deref(),
                 idempotency_key.as_deref(),
                 body,
             )
             .await
         }
+        ("POST", "/v1/packs/logout") => {
+            api::handle_logout(state, cookie.as_deref(), origin.as_deref()).await
+        }
         ("POST", "/v1/packs/revoke") => api::handle_revoke(state, body).await,
         ("POST", "/v1/packs/introspect") => {
-            api::handle_introspect(state, authorization.as_deref()).await
+            api::handle_introspect(state, cookie.as_deref(), origin.as_deref()).await
         }
         ("GET", "/v1/revocations") => api::handle_revocations(state, &query).await,
         ("GET", "/v1/marketplace/packs") => api::handle_marketplace_list(state, &query).await,

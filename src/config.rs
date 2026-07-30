@@ -9,6 +9,9 @@ pub struct Config {
     pub revocation_window_days: i64,
     pub max_pack_uses: i64,
     pub max_validity_seconds: i64,
+    pub allowed_origin: String,
+    pub session_ttl_seconds: i64,
+    pub cookie_secure: bool,
 }
 
 impl Config {
@@ -31,6 +34,10 @@ impl Config {
                 10 * 365 * 24 * 60 * 60,
             )
             .max(3600),
+            allowed_origin: required("PACK_AUTH_ALLOWED_ORIGIN")?,
+            session_ttl_seconds: env_i64("PACK_AUTH_SESSION_TTL_SECONDS", 30 * 24 * 60 * 60)
+                .clamp(300, 30 * 24 * 60 * 60),
+            cookie_secure: env_bool("PACK_AUTH_COOKIE_SECURE", true),
         })
     }
 }
@@ -43,5 +50,16 @@ fn env_i64(name: &str, default: i64) -> i64 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| match value.to_ascii_lowercase().as_str() {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        })
         .unwrap_or(default)
 }

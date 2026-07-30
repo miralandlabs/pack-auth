@@ -86,6 +86,12 @@ pub enum ChallengeNonceOutcome {
     RateLimited,
 }
 
+#[derive(Clone, Debug)]
+pub struct PackSessionRow {
+    pub wallet: String,
+    pub pack: PackRow,
+}
+
 #[derive(Clone)]
 pub struct AuthDb {
     pool: Pool,
@@ -255,6 +261,72 @@ impl AuthDb {
         ).await?.map(pack_from_row))
     }
 
+    pub async fn create_pack_session(
+        &self,
+        session_hash: &[u8],
+        jti: Uuid,
+        wallet: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), Error> {
+        let client = self.conn().await?;
+        open_transaction(&client, "create pack session").await?;
+        let result = async {
+            wire(
+                client.execute(
+                    "DELETE FROM pack_auth_sessions WHERE jti=$1",
+                    &[&jti],
+                ),
+                "replace pack session",
+            )
+            .await?;
+            wire(
+                client.execute(
+                    "INSERT INTO pack_auth_sessions(session_hash, jti, wallet, expires_at) VALUES($1,$2,$3,$4)",
+                    &[&session_hash, &jti, &wallet, &expires_at],
+                ),
+                "insert pack session",
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        finish(client, result, "create pack session").await
+    }
+
+    pub async fn get_pack_for_session(
+        &self,
+        session_hash: &[u8],
+    ) -> Result<Option<PackSessionRow>, Error> {
+        Ok(self
+            .query_opt(
+                r#"SELECT s.wallet, p.jti, p.service_id, p.payer, p.pack_id,
+                          p.total_uses, p.used_uses, p.resources, p.issued_at,
+                          p.expires_at, p.revoked_at
+                   FROM pack_auth_sessions s
+                   JOIN pack_auth_packs p ON p.jti=s.jti
+                   WHERE s.session_hash=$1 AND s.revoked_at IS NULL
+                     AND s.expires_at > NOW()"#,
+                &[&session_hash],
+                "get pack session",
+            )
+            .await?
+            .map(|row| PackSessionRow {
+                wallet: row.get("wallet"),
+                pack: pack_from_row(row),
+            }))
+    }
+
+    pub async fn revoke_pack_session(&self, session_hash: &[u8]) -> Result<bool, Error> {
+        Ok(self
+            .execute(
+                "UPDATE pack_auth_sessions SET revoked_at=NOW() WHERE session_hash=$1 AND revoked_at IS NULL",
+                &[&session_hash],
+                "revoke pack session",
+            )
+            .await?
+            > 0)
+    }
+
     pub async fn revoke_pack(
         &self,
         jti: Uuid,
@@ -292,6 +364,60 @@ impl AuthDb {
             }
             Err(error) => {
                 rollback(&client, "consume pack").await;
+                discard(client);
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn consume_pack_with_session(
+        &self,
+        session_hash: &[u8],
+        jti: Uuid,
+        idempotency_key: &str,
+        resource: &str,
+    ) -> Result<ConsumeOutcome, Error> {
+        let client = self.conn().await?;
+        if let Err(error) = open_transaction(&client, "consume pack session").await {
+            discard(client);
+            return Err(error);
+        }
+        let result = async {
+            let session = wire(
+                client.query_opt(
+                    "SELECT jti FROM pack_auth_sessions WHERE session_hash=$1 AND jti=$2 AND revoked_at IS NULL AND expires_at > NOW() FOR UPDATE",
+                    &[&session_hash, &jti],
+                ),
+                "lock pack session",
+            )
+            .await?;
+            if session.is_none() {
+                return Ok(ConsumeOutcome::NotFound);
+            }
+            let outcome = self
+                .consume_pack_in_open_tx(&client, jti, idempotency_key, resource)
+                .await?;
+            wire(
+                client.execute(
+                    "UPDATE pack_auth_sessions SET last_used_at=NOW() WHERE session_hash=$1",
+                    &[&session_hash],
+                ),
+                "touch pack session",
+            )
+            .await?;
+            Ok(outcome)
+        }
+        .await;
+        match result {
+            Ok(outcome) => {
+                if let Err(error) = commit(&client, "consume pack session").await {
+                    discard(client);
+                    return Err(error);
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                rollback(&client, "consume pack session").await;
                 discard(client);
                 Err(error)
             }

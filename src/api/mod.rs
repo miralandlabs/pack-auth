@@ -2,9 +2,11 @@ mod marketplace;
 mod resources;
 
 use {
+    base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine},
     chrono::{DateTime, Utc},
     serde::Deserialize,
     serde_json::{json, Value},
+    sha2::{Digest, Sha256},
     std::sync::Arc,
     uuid::Uuid,
     vercel_runtime::{Body, Response},
@@ -14,7 +16,9 @@ use crate::{
     challenge_auth::{self, Action, BoundFields, ChallengeBuildParams, ParsedChallenge},
     db::{ChallengeNonceOutcome, ConsumeOutcome, InsertServiceParams, PackRow, ServiceRow},
     error::{into_vercel_response, Error},
-    http_util::{cors_options, json_response, parse_wallet_path},
+    http_util::{
+        cors_options, json_response, json_response_with_cookie, parse_cookie, parse_wallet_path,
+    },
     jwt,
     pack_bundles::{extract_catalog_index, find_pack, validate_pack_bundles},
     service_id::validate_service_id,
@@ -25,6 +29,7 @@ pub use marketplace::{handle_marketplace_detail, handle_marketplace_list};
 use resources::{resource_allowed, resources_subset_of_allowlist};
 
 const CHALLENGE_TTL_SECONDS: u64 = 600;
+const SESSION_COOKIE: &str = "pack_session";
 
 #[derive(Deserialize)]
 pub struct SignedBody {
@@ -54,6 +59,12 @@ pub struct UpdateBody {
 #[derive(Deserialize)]
 pub struct ConsumeBody {
     pub resource: String,
+}
+
+#[derive(Deserialize)]
+pub struct SessionBody {
+    #[serde(flatten)]
+    pub signed: SignedBody,
 }
 
 #[derive(Deserialize)]
@@ -328,11 +339,13 @@ pub async fn handle_issue(state: Arc<AppState>, body_text: String) -> Response<B
 
 pub async fn handle_consume(
     state: Arc<AppState>,
-    auth: Option<&str>,
+    cookie: Option<&str>,
+    origin: Option<&str>,
     idempotency_key: Option<&str>,
     body_text: String,
 ) -> Response<Body> {
-    let result = async {
+    let result: Result<Value, Error> = async {
+        require_allowed_origin(&state, origin)?;
         let key = idempotency_key
             .map(str::trim)
             .filter(|key| (8..=200).contains(&key.len()))
@@ -341,31 +354,32 @@ pub async fn handle_consume(
         if body.resource.is_empty() || body.resource.len() > 1000 {
             return Err(Error::BadRequest("invalid resource".into()));
         }
-        let token = jwt::decode_bearer_token(auth)?;
-        let claims = verify_pack_token(&state, &token).await?;
-        let jti = Uuid::parse_str(&claims.jti)
-            .map_err(|e| Error::Unauthorized(format!("invalid jti: {e}")))?;
-        let pack = state
+        let session_hash = session_hash_from_cookie(cookie)?;
+        let session = state
             .require_db()?
-            .get_pack(jti)
+            .get_pack_for_session(&session_hash)
             .await?
-            .ok_or_else(|| Error::Unauthorized("unknown pack token".into()))?;
-        claims_match_pack(&claims, &pack)?;
-        if !resource_allowed(&body.resource, &pack.resources) {
+            .ok_or_else(|| Error::Unauthorized("session missing, expired, or revoked".into()))?;
+        if session.wallet != session.pack.payer {
+            return Err(Error::Unauthorized("session wallet mismatch".into()));
+        }
+        if !resource_allowed(&body.resource, &session.pack.resources) {
             return Err(Error::Forbidden("resource outside pack scope".into()));
         }
         match state
             .require_db()?
-            .consume_pack(jti, key, &body.resource)
+            .consume_pack_with_session(&session_hash, session.pack.jti, key, &body.resource)
             .await?
         {
             ConsumeOutcome::Consumed(value) => Ok(json!({
                 "success": true, "consumption_id": value.consumption_id,
-                "jti": jti, "resource": body.resource,
+                "jti": session.pack.jti, "resource": body.resource,
                 "remaining_uses": value.remaining_uses,
                 "consumed_at": value.consumed_at.to_rfc3339(), "replayed": value.replayed
             })),
-            ConsumeOutcome::NotFound => Err(Error::Unauthorized("unknown pack token".into())),
+            ConsumeOutcome::NotFound => Err(Error::Unauthorized(
+                "session missing, expired, or revoked".into(),
+            )),
             ConsumeOutcome::Revoked => Err(Error::Unauthorized("pack revoked".into())),
             ConsumeOutcome::Expired => Err(Error::Unauthorized("pack expired".into())),
             ConsumeOutcome::Exhausted => Err(Error::Exhausted("no uses remaining".into())),
@@ -376,6 +390,85 @@ pub async fn handle_consume(
     }
     .await;
     into_vercel_response(result)
+}
+
+pub async fn handle_create_session(
+    state: Arc<AppState>,
+    auth: Option<&str>,
+    origin: Option<&str>,
+    body_text: String,
+) -> Response<Body> {
+    let result = async {
+        require_allowed_origin(&state, origin)?;
+        let body: SessionBody = parse_body(&body_text)?;
+        let token = jwt::decode_bearer_token(auth)?;
+        let claims = verify_pack_token(&state, &token).await?;
+        let jti = Uuid::parse_str(&claims.jti)
+            .map_err(|e| Error::Unauthorized(format!("invalid jti: {e}")))?;
+        let pack = state
+            .require_db()?
+            .get_pack(jti)
+            .await?
+            .ok_or_else(|| Error::Unauthorized("unknown pack token".into()))?;
+        claims_match_pack(&claims, &pack)?;
+        if pack.revoked_at.is_some() || pack.expires_at <= Utc::now() {
+            return Err(Error::Unauthorized("pack is revoked or expired".into()));
+        }
+        let wallet = wallet_from_message(&body.signed.message)?;
+        if wallet != claims.payer {
+            return Err(Error::Unauthorized(
+                "signing wallet is not token payer".into(),
+            ));
+        }
+        let parsed = verify_and_consume(&state, wallet, &body.signed, Action::Session).await?;
+        ensure_bound(&parsed.fields.service_id, &claims.sub, "service_id")?;
+        ensure_bound(&parsed.fields.jti, &claims.jti, "jti")?;
+
+        let session_secret = random_session_secret()?;
+        let session_hash = hash_session_secret(&session_secret);
+        let configured_expiry =
+            Utc::now() + chrono::Duration::seconds(state.config.session_ttl_seconds);
+        let expires_at = configured_expiry.min(pack.expires_at);
+        let max_age = (expires_at - Utc::now()).num_seconds().max(1);
+        state
+            .require_db()?
+            .create_pack_session(&session_hash, jti, wallet, expires_at)
+            .await?;
+        let cookie = session_cookie(&state, &session_secret, max_age);
+        Ok((
+            json!({
+                "success": true,
+                "wallet": wallet,
+                "jti": jti,
+                "expires_at": expires_at.to_rfc3339()
+            }),
+            cookie,
+        ))
+    }
+    .await;
+    match result {
+        Ok((value, cookie)) => json_response_with_cookie(200, &value, &cookie),
+        Err(error) => error.to_vercel_response(),
+    }
+}
+
+pub async fn handle_logout(
+    state: Arc<AppState>,
+    cookie: Option<&str>,
+    origin: Option<&str>,
+) -> Response<Body> {
+    let result: Result<Value, Error> = async {
+        require_allowed_origin(&state, origin)?;
+        if let Ok(hash) = session_hash_from_cookie(cookie) {
+            state.require_db()?.revoke_pack_session(&hash).await?;
+        }
+        Ok(json!({ "success": true }))
+    }
+    .await;
+    match result {
+        Ok(value) => json_response_with_cookie(200, &value, &clear_session_cookie(&state)),
+        Err(error) => error.to_vercel_response(),
+    }
 }
 
 pub async fn handle_revoke(state: Arc<AppState>, body_text: String) -> Response<Body> {
@@ -400,16 +493,20 @@ pub async fn handle_revoke(state: Arc<AppState>, body_text: String) -> Response<
     into_vercel_response(result)
 }
 
-pub async fn handle_introspect(state: Arc<AppState>, auth: Option<&str>) -> Response<Body> {
+pub async fn handle_introspect(
+    state: Arc<AppState>,
+    cookie: Option<&str>,
+    origin: Option<&str>,
+) -> Response<Body> {
     let result = async {
-        let token = jwt::decode_bearer_token(auth)?;
-        let claims = verify_pack_token(&state, &token).await?;
-        let jti = Uuid::parse_str(&claims.jti)
-            .map_err(|e| Error::Unauthorized(format!("invalid jti: {e}")))?;
-        let Some(pack) = state.require_db()?.get_pack(jti).await? else {
-            return Ok(json!({ "active": false }));
-        };
-        claims_match_pack(&claims, &pack)?;
+        require_allowed_origin(&state, origin)?;
+        let session_hash = session_hash_from_cookie(cookie)?;
+        let session = state
+            .require_db()?
+            .get_pack_for_session(&session_hash)
+            .await?
+            .ok_or_else(|| Error::Unauthorized("session missing, expired, or revoked".into()))?;
+        let pack = session.pack;
         let remaining = pack.total_uses - pack.used_uses;
         let active = pack.revoked_at.is_none() && pack.expires_at > Utc::now() && remaining > 0;
         Ok(json!({
@@ -575,6 +672,47 @@ fn claims_match_pack(claims: &jwt::TokenClaims, pack: &PackRow) -> Result<(), Er
     } else {
         Ok(())
     }
+}
+
+fn require_allowed_origin(state: &AppState, origin: Option<&str>) -> Result<(), Error> {
+    if origin == Some(state.config.allowed_origin.as_str()) {
+        Ok(())
+    } else {
+        Err(Error::Forbidden("request origin is not allowed".into()))
+    }
+}
+
+fn random_session_secret() -> Result<String, Error> {
+    let mut bytes = [0_u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|_| Error::Internal("secure random generator failed".into()))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn hash_session_secret(secret: &str) -> Vec<u8> {
+    Sha256::digest(secret.as_bytes()).to_vec()
+}
+
+fn session_hash_from_cookie(cookie: Option<&str>) -> Result<Vec<u8>, Error> {
+    let secret = parse_cookie(cookie, SESSION_COOKIE)
+        .filter(|value| value.len() == 43)
+        .ok_or_else(|| Error::Unauthorized("pack session cookie required".into()))?;
+    Ok(hash_session_secret(secret))
+}
+
+fn session_cookie(state: &AppState, secret: &str, max_age: i64) -> String {
+    let secure = if state.config.cookie_secure {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{SESSION_COOKIE}={secret}; Path=/v1/packs; Max-Age={max_age}; HttpOnly; SameSite=Strict{secure}"
+    )
+}
+
+fn clear_session_cookie(state: &AppState) -> String {
+    session_cookie(state, "deleted", 0)
 }
 
 fn pack_json(row: &PackRow) -> Value {

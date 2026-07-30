@@ -24,6 +24,7 @@ pub enum Action {
     Issue,
     Revoke,
     List,
+    Session,
 }
 
 impl Action {
@@ -35,6 +36,7 @@ impl Action {
             Self::Issue => "issue",
             Self::Revoke => "revoke",
             Self::List => "list",
+            Self::Session => "session",
         }
     }
     pub fn parse(value: &str) -> Result<Self, String> {
@@ -45,6 +47,7 @@ impl Action {
             "issue" => Ok(Self::Issue),
             "revoke" => Ok(Self::Revoke),
             "list" => Ok(Self::List),
+            "session" => Ok(Self::Session),
             _ => Err(format!("unknown action: {value}")),
         }
     }
@@ -207,7 +210,7 @@ fn push_fields(lines: &mut Vec<String>, action: &Action, fields: &BoundFields) {
             push("validity_seconds", &fields.validity_seconds);
             push("resources_json", &fields.resources_json);
         }
-        Action::Revoke => push("jti", &fields.jti),
+        Action::Revoke | Action::Session => push("jti", &fields.jti),
         Action::List => {}
     }
 }
@@ -283,5 +286,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.fields.total_uses.as_deref(), Some("10"));
+    }
+
+    #[test]
+    fn session_challenge_binds_pack_to_wallet() {
+        let keypair = solana_keypair::Keypair::new();
+        let wallet = keypair.pubkey().to_string();
+        let params = ChallengeBuildParams {
+            action: Action::Session,
+            fields: BoundFields {
+                service_id: Some("api.example.com".into()),
+                jti: Some("55a44da0-34ee-45a9-9c77-2f6bf7b4eb44".into()),
+                ..Default::default()
+            },
+        };
+        let (message, _) = build_challenge_message(
+            b"a-secret-that-is-longer-than-32-bytes",
+            &wallet,
+            600,
+            params,
+        )
+        .unwrap();
+        let signature = keypair.sign_message(message.as_bytes()).to_string();
+        let parsed = verify_challenge_submission(
+            b"a-secret-that-is-longer-than-32-bytes",
+            &wallet,
+            &message,
+            &signature,
+        )
+        .unwrap();
+        assert_eq!(parsed.action, Action::Session);
+        assert_eq!(parsed.wallet, wallet);
+        assert_eq!(
+            parsed.fields.jti.as_deref(),
+            Some("55a44da0-34ee-45a9-9c77-2f6bf7b4eb44")
+        );
     }
 }
