@@ -1,0 +1,6 @@
+.DS_Store
+.Rhistory
+.env
+.env.*
+!.env.example
+target/
