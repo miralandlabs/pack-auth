@@ -60,6 +60,44 @@ The pack token cannot call `/consume` directly. It is used only to activate a se
 
 See [`public/openapi.json`](public/openapi.json) for the API description.
 
+## Quick start
+
+Requirements: Rust, PostgreSQL, and Node.js.
+
+### 1. Configure
+
+```bash
+cd pack-auth
+cp env.example .env.local
+```
+
+Set a valid `DATABASE_URL`, HMAC secret, and RSA private key in `.env.local`. Keep `PACK_AUTH_COOKIE_SECURE=false` for local HTTP. Never commit this file.
+
+### 2. Initialize the database
+
+```bash
+set -a
+source .env.local
+set +a
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/init.sql
+```
+
+### 3. Start the API
+
+Before starting, make sure the Rust entry path in `Cargo.toml` and `vercel.json` points to the same file under `api/`.
+
+```bash
+npx vercel dev --listen 3000
+```
+
+### 4. Check
+
+```bash
+curl http://localhost:3000/health
+```
+
+A successful JSON response means the API is running and connected to PostgreSQL. A browser frontend should run on `http://localhost:3001`, use `http://localhost:3000` as its API URL, and send requests with `credentials: "include"`.
+
 ## Database
 
 For a new database:
